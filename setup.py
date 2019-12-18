@@ -18,12 +18,11 @@ setup(
     package_dir={'base_counter': 'base_counter'},
     entry_points={
         'console_scripts': ['base_counter = base_counter.base_counter:main',
-        'variant_detection = base_counter.variant_detection:main',
-        'reference_bases = base_counter.reference_bases:main']
+                            'dist_plots = base_counter.dist_plots:main']
     },
     url='https://github.com/bjpop/base_counter',
     license='LICENSE',
     description=('Count bases in a defined genomic region'),
     long_description=(LONG_DESCRIPTION),
-    install_requires=["pysam", "numpy", "scipy", "intervaltree"],
+    install_requires=["pysam", "numpy", "scipy", "pandas==0.25.2", "seaborn==0.9.0", "matplotlib==3.1.1"]
 )
