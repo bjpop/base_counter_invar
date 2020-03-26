@@ -20,7 +20,10 @@ import csv
 
 EXIT_FILE_IO_ERROR = 1
 EXIT_COMMAND_LINE_ERROR = 2
+EXIT_INVALID_UMI = 3
+EXIT_REPEAT_READ_UMI = 4
 PROGRAM_NAME = "base_counter"
+UMI_LENGTH = 10
 
 
 try:
@@ -54,6 +57,8 @@ def parse_args():
         help='Bed file coordinates of genomic targets to consider')
     parser.add_argument('--sample', type=str, required=True,
         help='Sample ID')
+    parser.add_argument('--umi', type=str, required=True, help='Path of FASTQ file containing UMIs')
+    parser.add_argument('--umistats', type=str, required=False, help='Path of CSV file to output UMI stats for this sample')
     parser.add_argument('--version',
                         action='version',
                         version='%(prog)s ' + PROGRAM_VERSION)
@@ -128,6 +133,7 @@ def is_variant(alt, counts):
 
 
 VALID_DNA_BASES = "ATGCN"
+valid_dna_bases_set = set(VALID_DNA_BASES)
 
 def process_bam_file(options, targets):
     total_reads = 0 
@@ -173,6 +179,37 @@ def process_bam_file(options, targets):
     samfile.close()
 
 
+def is_valid_umi(umi):
+    return len(umi) == UMI_LENGTH and valid_dna_bases_set.issuperset(set(umi)) 
+
+def get_umis(options):
+    # mapping from read IDs to UMIs
+    result = {}
+    with pysam.FastxFile(options.umi) as fh:
+        for entry in fh:
+            if entry.name not in result:
+                if is_valid_umi(entry.sequence):
+                   result[entry.name] = entry.sequence
+                else:
+                   exit_with_error(f"Invalid UMI: {entry.sequence}", EXIT_INVALID_UMI) 
+            else:
+                exit_with_error(f"Read ID repeated in UMI file: {entry.name}", EXIT_REPEAT_READ_UMI)
+    return result
+
+def umi_stats(options, umis):
+    total_umis = 0
+    unique_umis = set()
+    for read,umi in umis.items():
+        total_umis += 1
+        unique_umis.add(umi)
+    num_unqiue_umis = len(unique_umis)
+    num_umis_with_n = sum([1 for u in unique_umis if u.count("N") > 0])
+    if options.umistats:
+        with open(options.umistats, "w") as file:
+            print(f"{total_umis},{num_unqiue_umis},{num_umis_with_n}", file=file)
+        
+
+
 def init_logging(log_filename):
     '''If the log_filename is defined, then
     initialise the logging facility, and write log statement
@@ -200,6 +237,9 @@ def main():
     "Orchestrate the execution of the program"
     options = parse_args()
     init_logging(options.log)
+    umis = get_umis(options)
+    umi_stats(options, umis)
+    exit(0)
     targets = get_targets(options) 
     process_bam_file(options, targets)
 
