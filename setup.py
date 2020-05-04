@@ -24,5 +24,5 @@ setup(
     license='LICENSE',
     description=('Count bases in a defined genomic region'),
     long_description=(LONG_DESCRIPTION),
-    install_requires=["pysam", "numpy", "scipy", "pandas==0.25.2", "seaborn==0.9.0", "matplotlib==3.1.1"]
+    install_requires=["pysam", "umi_tools==1.0.1"]
 )

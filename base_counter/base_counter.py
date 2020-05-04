@@ -16,6 +16,8 @@ import pkg_resources
 import pysam
 import pathlib
 import csv
+from umi_tools import UMIClusterer
+from collections import defaultdict, namedtuple
 
 
 EXIT_FILE_IO_ERROR = 1
@@ -100,7 +102,6 @@ class Counts(object):
         self.G = 0
         self.C = 0
         self.N = 0
-        self.UMIs = set()
 
     def increment_base_count(self, base):
         if base == 'A':
@@ -132,51 +133,309 @@ def is_variant(alt, counts):
         return False
 
 
+def group_runs_by(xs, project, comp):
+    result = []
+    current = 0
+    this_group = []
+    while current < len(xs):
+        this_item = xs[current]
+        this_key = project(this_item)
+        if current == 0:
+            this_group.append(this_item)
+        else:
+            previous_key = project(xs[current - 1])
+            if comp(this_key, previous_key):
+                this_group.append(this_item)
+            else:
+                result.append(this_group)
+                this_group = [this_item]
+        current += 1
+    if this_group:
+        result.append(this_group)
+    return result
+
+def adjacent(x, y):
+    return x - y <= 1
+
 VALID_DNA_BASES = "ATGCN"
 valid_dna_bases_set = set(VALID_DNA_BASES)
 
-def process_bam_file(options, targets):
-    total_reads = 0 
-    fieldnames = ['chrom', 'pos', 'ref', 'alt', 'sample', 'is carrier', 'A', 'T', 'G', 'C', 'N', 'DP', 'UMI', 'read/UMI', 'maybe variant']
-    writer = csv.DictWriter(sys.stdout, delimiter=',', fieldnames=fieldnames) 
-    writer.writeheader()
+def chrom_name_remove_chr(chrom):
+    chrom_no_chr = chrom
+    if chrom_no_chr.startswith('chr'):
+        chrom_no_chr = chrom_no_chr[3:] 
+    return chrom_no_chr
+
+def get_pileup_reads(samfile, chrom, start, end):
+    pileup_reads = []
+    # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
+    # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
+    # NOTE: this loop should only happen once for each variant, since they are SNVs and occupy one genomics position
+    for pileupcolumn in samfile.pileup(chrom, start, end, truncate=True, stepper='samtools',
+                                       ignore_overlaps=False, ignore_orphans=False,
+                                       max_depth=1000000000):
+        pileupcolumn.set_min_base_quality(0)
+        for pileupread in pileupcolumn.pileups:
+            pileup_reads.append(pileupread)
+    return pileup_reads
+
+
+def validate_clusters(counts, clusters):
+    counts_umis = sorted(counts.keys())
+    clusters_umis = sorted([u for c in clusters for u in c])
+    return counts_umis == clusters_umis
+
+# umis_to_reads is a dictionary mapping umi to [reads]
+UmiCluster = namedtuple("UmiCluster", ["umis_to_reads"])
+
+'''
+read_groups is a list of read groups, where each group is aligned
+to the same location (or similar location).
+
+This function clusters the umis for each group.
+
+Result is [UmiCluster]
+'''
+def cluster_reads_by_umi(umis, read_groups):
+    umi_clusterer = UMIClusterer(cluster_method="directional")
+    result = []
+    for group in read_groups:
+        # number of reads for each umi
+        umi_counts = defaultdict(int) 
+        # reads associated with each umi
+        umi_reads = defaultdict(list)
+        for read in group:
+            this_alignment = read.alignment
+            query_name = this_alignment.query_name
+            if query_name in umis:
+                # UMIClusterer requires a bytestring
+               this_umi = umis[query_name].encode()
+               umi_counts[this_umi] += 1 
+               umi_reads[this_umi].append(read)
+        umi_clusters = umi_clusterer(umi_counts, threshold=1)
+        for this_cluster in umi_clusters:
+            this_umis_to_reads = {}
+            for this_umi in this_cluster:
+                this_umis_to_reads[this_umi] = umi_reads[this_umi]
+            result_cluster = UmiCluster(umis_to_reads = this_umis_to_reads)
+            result.append(result_cluster)
+    return result 
+    
+
+def display_umi_clusters(clusters):
+    for this_cluster in clusters:
+        umis = this_cluster.umis_to_reads.keys()
+        cluster_size = len(umis) 
+        if cluster_size >= 8:
+            print(30 * '-')
+            print(f"size: {cluster_size}")
+            for this_umi, this_umi_reads in this_cluster.umis_to_reads.items():
+                print(f"\t{this_umi}")
+                for read in this_umi_reads:
+                    pos = read.alignment.reference_start
+                    print(f"{pos} {read.alignment.query_sequence}") 
+
+
+def get_cluster_dominant_base(bases):
+    counts = Counts()
+    for base in bases:
+        counts.increment_base_count(base)
+    sorted_counts = sorted([(counts.A, 'A'), (counts.T, 'T'), (counts.G, 'G'), (counts.C, 'C')])
+    max_count, max_base = sorted_counts[-1]
+    if max_count > 0:
+        return max_base
+    else:
+        return None
+
+def count_bases(clusters):
+    # base counts for collapsed UMI clusters
+    cluster_counts = Counts()
+    # base counts for all reads at this locus
+    all_counts = Counts()
+    # this_cluster is a collection of UMIs that cluster together and should be
+    # considered the same. We should flatten them into a single base call
+    for this_cluster in clusters: 
+        this_cluster_bases = []
+        for umi, this_reads in this_cluster.umis_to_reads.items():
+            for read in this_reads:
+                if not read.is_del and not read.is_refskip:
+                    this_base = read.alignment.query_sequence[read.query_position].upper()
+                    this_cluster_bases.append(this_base)
+                    all_counts.increment_base_count(this_base)
+        dominant_base = get_cluster_dominant_base(this_cluster_bases) 
+        if dominant_base is not None:
+            cluster_counts.increment_base_count(dominant_base)
+    return cluster_counts, all_counts
+
+
+def compute_vaf(counts, allele):
+    if allele == 'A':
+        num = counts.A
+    elif allele == 'T':
+        num = counts.T
+    elif allele == 'G':
+        num = counts.G
+    elif allele == 'C':
+        num = counts.C
+    elif allele == 'N':
+        num = counts.N
+    else:
+        num = 0
+    total = counts.A + counts.T + counts.G + counts.C + counts.N
+    if total > 0:
+       return num / total
+    else:
+       return ''
+    
+fieldnames = ['chrom', 'pos', 'ref', 'alt', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'A_raw', 'T_raw', 'G_raw', 'C_raw', 'N_raw', 'DP_raw', 'vaf_raw', 'maybe_variant']
+
+def process_bam_file(options, umis, targets):
     sample = options.sample
     samfile = pysam.AlignmentFile(options.bam, "rb" )
     logging.info(f"Processing BAM file from {options.bam} for sample {sample}")
+    writer = csv.DictWriter(sys.stdout, delimiter=',', fieldnames=fieldnames) 
+    writer.writeheader()
     for coord, meta in targets.items():
         chrom, start, end = coord
-        chrom_no_chr = chrom
-        if chrom_no_chr.startswith('chr'):
-            chrom_no_chr = chrom_no_chr[3:]
-        carrier_sample, ref, alt, vaf = meta
+        #print(30 * '#')
+        #print(f"{chrom} {start} {end}")
+        # we are only considering SNVs, so the start and end coord should always be exactly 1 bp apart
+        assert end - start == 1
+        chrom_no_chr = chrom_name_remove_chr(chrom) 
+        carrier_sample, ref, alt, tumour_vaf = meta
         is_carrier = sample == carrier_sample
-      
-        # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
-        # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
-        for pileupcolumn in samfile.pileup(chrom_no_chr, start, end, truncate=True, stepper='samtools',
-                                           ignore_overlaps=False, ignore_orphans=False,
-                                           max_depth=1000000000):
-            this_pos_zero_based = pileupcolumn.pos
-            this_pos_one_based = this_pos_zero_based + 1
-            counts = Counts()
-            # the maximum number of reads aligning to this position before filtering
-            unfiltered_coverage = pileupcolumn.nsegments
-            # collect all bases in the current column, and assign them to either read1s or read2s
-            for pileupread in pileupcolumn.pileups:
-                this_alignment = pileupread.alignment
-                query_name = this_alignment.query_name
-                mapping_quality = this_alignment.mapping_quality
-                alignment_length = this_alignment.query_alignment_length
-                is_read1 = this_alignment.is_read1
-                is_read2 = this_alignment.is_read2
-                if not pileupread.is_del and not pileupread.is_refskip:
-                    this_base = pileupread.alignment.query_sequence[pileupread.query_position].upper()
-                    counts.increment_base_count(this_base)
-            total_counts = counts.A + counts.T + counts.G + counts.C + counts.N
-            maybe_variant = is_carrier and is_variant(alt, counts)
-            output_row = {'chrom': chrom, 'pos': this_pos_one_based, 'ref': ref, 'alt': alt, 'sample': sample, 'is carrier': is_carrier, 'A': counts.A, 'T': counts.T, 'G': counts.G, 'C': counts.C, 'N': counts.N, 'DP': total_counts, 'UMI': 0, 'read/UMI': 0, 'maybe variant': maybe_variant }
-            writer.writerow(output_row) 
+        # get all the reads that align to this position
+        pileup_reads = get_pileup_reads(samfile, chrom_no_chr, start, end)
+        # sort the pileup reads based on their leftmost alignment coordinate
+        sorted_pileup_reads = sorted(pileup_reads, key=lambda r: r.alignment.reference_start)
+        # group the pileup reads into runs where consecutive reads are at most 1bp apart
+        # grouped_pileup_reads_pos = group_runs_by(pileup_reads, lambda r: r.alignment.reference_start, adjacent)
+        grouped_pileup_reads_pos = group_runs_by(sorted_pileup_reads, lambda r: r.alignment.reference_start, adjacent)
+        umi_clusters = cluster_reads_by_umi(umis, grouped_pileup_reads_pos)
+        #display_umi_clusters(umi_clusters)
+        cluster_counts, raw_counts = count_bases(umi_clusters)
+        depth_uncorrected = len(pileup_reads)
+        depth_corrected = cluster_counts.A + cluster_counts.T + cluster_counts.G + cluster_counts.C + cluster_counts.N
+        maybe_variant = is_carrier and is_variant(alt, cluster_counts)
+        # bed file input coordinates are zero based, but output format is 1-based to be similar with VCF and
+        # standard variant nomenclature 
+        vaf = compute_vaf(cluster_counts, alt)
+        vaf_raw = compute_vaf(raw_counts, alt)
+        this_row = {'chrom': chrom, 'pos': start+1, 'ref': ref, 'alt': alt, 'sample': sample, 'is_carrier': is_carrier, 'tumour_vaf': tumour_vaf,
+                    'A': cluster_counts.A, 'T': cluster_counts.T, 'G': cluster_counts.G, 'C': cluster_counts.C, 'N': cluster_counts.N, 'DP': depth_corrected, 'vaf': vaf,
+                    'A_raw': raw_counts.A, 'T_raw': raw_counts.T, 'G_raw': raw_counts.G, 'C_raw': raw_counts.C, 'N_raw': raw_counts.N, 'DP_raw': depth_uncorrected, 'vaf_raw': vaf_raw,
+                    'maybe_variant': maybe_variant}
+        writer.writerow(this_row)
     samfile.close()
+
+#def process_bam_file(options, umis, targets):
+#    total_reads = 0 
+#    fieldnames = ['chrom', 'pos', 'ref', 'alt', 'sample', 'is carrier', 'A', 'T', 'G', 'C', 'N', 'DP', 'UMI', 'read/UMI', 'maybe variant']
+#    writer = csv.DictWriter(sys.stdout, delimiter=',', fieldnames=fieldnames) 
+#    writer.writeheader()
+#    sample = options.sample
+#    samfile = pysam.AlignmentFile(options.bam, "rb" )
+#    logging.info(f"Processing BAM file from {options.bam} for sample {sample}")
+#    for coord, meta in targets.items():
+#        chrom, start, end = coord
+#        chrom_no_chr = chrom
+#        if chrom_no_chr.startswith('chr'):
+#            chrom_no_chr = chrom_no_chr[3:]
+#        carrier_sample, ref, alt, vaf = meta
+#        is_carrier = sample == carrier_sample
+#
+#        print(50 * '#')
+#        print(f'{chrom} {start} {end}') 
+#      
+#        # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
+#        # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
+#        # NOTE: this loop should only happen once for each variant, since they are SNVs and occupy one genomics position
+#        for pileupcolumn in samfile.pileup(chrom_no_chr, start, end, truncate=True, stepper='samtools',
+#                                           ignore_overlaps=False, ignore_orphans=False,
+#                                           max_depth=1000000000):
+#            this_pos_zero_based = pileupcolumn.pos
+#            this_pos_one_based = this_pos_zero_based + 1
+#            print(f'this_pos_one_based: {this_pos_one_based}')
+#            #counts = Counts()
+#            #umi_counts = defaultdict(int) 
+#            #umi_bases = defaultdict(list)
+#            #umi_reads = defaultdict(list)
+#            #reads_no_umi = set()
+#            # the maximum number of reads aligning to this position before filtering
+#            #unfiltered_coverage = pileupcolumn.nsegments
+#            # collect all bases in the current column, and assign them to either read1s or read2s
+#            pileup_reads = []
+#            for pileupread in pileupcolumn.pileups:
+#                '''
+#                this_alignment = pileupread.alignment
+#                query_name = this_alignment.query_name
+#                if query_name in umis:
+#                   # UMIClusterer requires a bytestring
+#                   this_umi = umis[query_name].encode()
+#                   umi_counts[this_umi] += 1 
+#                   umi_reads[this_umi].append((pileupread.alignment.query_sequence, pileupread.alignment.reference_start))
+#                else:
+#                   reads_no_umi.add(query_name)
+#                mapping_quality = this_alignment.mapping_quality
+#                alignment_length = this_alignment.query_alignment_length
+#                if not pileupread.is_del and not pileupread.is_refskip:
+#                    this_base = pileupread.alignment.query_sequence[pileupread.query_position].upper()
+#                    counts.increment_base_count(this_base)
+#                    umi_bases[this_umi].append(this_base)
+#                '''
+#                pileup_reads.append(pileupread)
+#            #total_counts = counts.A + counts.T + counts.G + counts.C + counts.N
+#            #maybe_variant = is_carrier and is_variant(alt, counts)
+#            #output_row = {'chrom': chrom, 'pos': this_pos_one_based, 'ref': ref, 'alt': alt, 'sample': sample, 'is carrier': is_carrier, 'A': counts.A, 'T': counts.T, 'G': counts.G, 'C': counts.C, 'N': counts.N, 'DP': total_counts, 'UMI': 0, 'read/UMI': 0, 'maybe variant': maybe_variant }
+#            #print(umi_counts)
+#            sorted_pileup_reads = sorted(pileup_reads, key=lambda r: r.alignment.reference_start)
+#            read_groups = group_runs_by(pileup_reads, lambda r: r.alignment.reference_start, adjacent)
+#            for g in read_groups:
+#                umi_counts = defaultdict(int) 
+#                umi_reads = defaultdict(list)
+#                for r in g:
+#                    this_alignment = r.alignment
+#                    query_name = this_alignment.query_name
+#                    if query_name in umis:
+#                        # UMIClusterer requires a bytestring
+#                       this_umi = umis[query_name].encode()
+#                       umi_counts[this_umi] += 1 
+#                       umi_reads[this_umi].append((r.alignment.query_sequence, r.alignment.reference_start))
+#                umi_clusterer = UMIClusterer(cluster_method="directional")
+#                clusters = umi_clusterer(umi_counts, threshold=1)
+#                for umi_cluster in clusters:
+#                    cluster_size = len(umi_cluster) 
+#                    if cluster_size > 1:
+#                        print(30 * '-')
+#                        print(f"size: {len(umi_cluster)}")
+#                        for u in umi_cluster:
+#                            print(f"\t{u}")
+#                            if u in umi_reads:
+#                                for r,p in umi_reads[u]:
+#                                    print(f"{p} {r}") 
+#                #print(30 * '-')
+#                #for r in g:
+#                #    print(f"pos: {r.alignment.reference_start}")
+#                #    print(f"val: {r.alignment.query_sequence}")
+#            '''
+#            umi_clusterer = UMIClusterer(cluster_method="directional")
+#            clusters = umi_clusterer(umi_counts, threshold=1)
+#            for umi_cluster in clusters:
+#                cluster_size = len(umi_cluster) 
+#                if cluster_size > 1:
+#                    print(30 * '-')
+#                    print(f"size: {len(umi_cluster)}")
+#                    for u in umi_cluster:
+#                        print(f"\t{u}")
+#                        if u in umi_bases:
+#                            print(f"\t{' '.join(umi_bases[u])}")
+#                        if u in umi_reads:
+#                            for r,p in umi_reads[u]:
+#                                print(f"{p} {r}") 
+#            '''
+#            #print(clusters) 
+#            #writer.writerow(output_row) 
+#    samfile.close()
 
 
 def is_valid_umi(umi):
@@ -185,8 +444,8 @@ def is_valid_umi(umi):
 def get_umis(options):
     # mapping from read IDs to UMIs
     result = {}
-    with pysam.FastxFile(options.umi) as fh:
-        for entry in fh:
+    with pysam.FastxFile(options.umi) as file:
+        for entry in file:
             if entry.name not in result:
                 if is_valid_umi(entry.sequence):
                    result[entry.name] = entry.sequence
@@ -199,7 +458,7 @@ def get_umis(options):
 def umi_stats(options, umis):
     total_umis = 0
     unique_umis = set()
-    for read,umi in umis.items():
+    for read, umi in umis.items():
         total_umis += 1
         unique_umis.add(umi)
     num_unqiue_umis = len(unique_umis)
@@ -237,11 +496,11 @@ def main():
     "Orchestrate the execution of the program"
     options = parse_args()
     init_logging(options.log)
+    # umis is a dictionary mapping read ID to UMI
     umis = get_umis(options)
     umi_stats(options, umis)
-    exit(0)
     targets = get_targets(options) 
-    process_bam_file(options, targets)
+    process_bam_file(options, umis, targets)
 
 
 # If this script is run from the command line then call the main function.
