@@ -199,14 +199,17 @@ def get_pileup_reads(mapqual_threshold, read_stats, samfile, chrom, start, end):
                 base_qualities.append(this_base_qual)
             read_stats.total_reads += 1
             this_map_qual = pileupread.alignment.mapping_quality
-            if mapqual_threshold is not None and this_map_qual >= mapqual_threshold:
+            if mapqual_threshold is None or this_map_qual >= mapqual_threshold:
                 read_stats.retained_reads += 1
                 pileup_reads.append(pileupread)
-    base_qual_mean = statistics.mean(base_qualities)
-    base_qual_stdev = statistics.stdev(base_qualities)
-    #base_qual_quartiles = statistics.quantiles(base_qualities, n=4)
-    # XXX fixme
-    base_qual_quartiles = [0, 0, 0]
+    try:
+        base_qual_mean = statistics.mean(base_qualities)
+        base_qual_stdev = statistics.stdev(base_qualities)
+        base_qual_quartiles = statistics.quantiles(base_qualities, n=4)
+    except statistics.StatisticsError:
+        base_qual_mean = None
+        base_qual_stdev = None
+        base_qual_quartiles = [None, None, None] 
     base_qual_stats = BaseQualStats(mean=base_qual_mean, stdev=base_qual_stdev, quartiles=base_qual_quartiles)
     return base_qual_stats, pileup_reads
 
