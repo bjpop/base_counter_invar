@@ -27,6 +27,8 @@ EXIT_INVALID_UMI = 3
 EXIT_REPEAT_READ_UMI = 4
 PROGRAM_NAME = "base_counter"
 UMI_LENGTH = 10
+DEFAULT_WINDOW = 1
+MAX_READ_DEPTH = 1000000000
 
 
 try:
@@ -62,6 +64,7 @@ def parse_args():
         help='Sample ID')
     parser.add_argument('--umi', type=str, required=True, help='Path of FASTQ file containing UMIs')
     #parser.add_argument('--umistats', type=str, required=False, help='Path of CSV file to output UMI stats for this sample')
+    parser.add_argument('--window', type=int, required=False, default=DEFAULT_WINDOW, help='Window of loci centered on target for base counting (default: %(default)s)')
     parser.add_argument('--mapqual', type=float, required=False, help='Minimum mapping quality threshold for reads')
     parser.add_argument('--version',
                         action='version',
@@ -90,11 +93,11 @@ def get_targets(options):
     with open(options.targets) as targets_file:
         for line in targets_file:
             fields = line.split()
-            chrom, start, end, label = fields[:4]
+            chrom, start, _end, label = fields[:4]
             carrier_sample, ref, alt, vaf = parse_target_label(label)
             start = int(start)
-            end = int(end)
-            result[(chrom, start, end)] = (carrier_sample, ref, alt, vaf)
+            #end = int(end)
+            result[(chrom, start)] = (carrier_sample, ref, alt, vaf)
     return result
 
 class Counts(object):
@@ -104,6 +107,7 @@ class Counts(object):
         self.G = 0
         self.C = 0
         self.N = 0
+        self.D = 0    # this counts absentt bases, such as deletions and refskips
 
     def increment_base_count(self, base):
         if base == 'A':
@@ -116,6 +120,8 @@ class Counts(object):
             self.C += 1
         elif base == 'N':
             self.N += 1
+        elif base == 'D':
+            self.D += 1
         else:
             exit(f"Unrecognised base: {base}")
 
@@ -183,15 +189,15 @@ class ReadStats:
 BaseQualStats = namedtuple("BaseQualStats", ["mean", "stdev", "quartiles"])
 
     
-def get_pileup_reads(mapqual_threshold, read_stats, samfile, chrom, start, end):
+def get_pileup_reads(mapqual_threshold, read_stats, samfile, chrom, pos):
     pileup_reads = []
     # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
     # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
     # NOTE: this loop should only happen once for each variant, since they are SNVs and occupy one genomics position
     base_qualities = []
-    for pileupcolumn in samfile.pileup(chrom, start, end, truncate=True, stepper='samtools',
+    for pileupcolumn in samfile.pileup(chrom, pos, pos+1, truncate=True, stepper='samtools',
                                        ignore_overlaps=False, ignore_orphans=False,
-                                       max_depth=1000000000):
+                                       max_depth=MAX_READ_DEPTH):
         pileupcolumn.set_min_base_quality(0)
         for pileupread in pileupcolumn.pileups:
             if not pileupread.is_del and not pileupread.is_refskip:
@@ -294,8 +300,11 @@ def count_bases(clusters):
             for read in this_reads:
                 if not read.is_del and not read.is_refskip:
                     this_base = read.alignment.query_sequence[read.query_position].upper()
-                    this_cluster_bases.append(this_base)
-                    all_counts.increment_base_count(this_base)
+                else:
+                    # deletion and refskip get special 'D' (deletion) base
+                    this_base = 'D'
+                this_cluster_bases.append(this_base)
+                all_counts.increment_base_count(this_base)
         dominant_base = get_cluster_dominant_base(this_cluster_bases) 
         if dominant_base is not None:
             cluster_counts.increment_base_count(dominant_base)
@@ -329,7 +338,7 @@ def get_noise(counts, ref, alt):
             noise_read_count += getattr(counts, base)
     return noise_read_count
     
-fieldnames = ['chrom', 'pos', 'ref', 'alt', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'A_raw', 'T_raw', 'G_raw', 'C_raw', 'N_raw', 'DP_raw', 'vaf_raw', 'base_qual_mean', 'base_qual_stdev', 'base_qual_quartile_1', 'base_qual_quartile_2', 'base_qual_quartile_3', 'maybe_variant']
+fieldnames = ['chrom', 'pos', 'ref', 'alt', 'is_target', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'A_raw', 'T_raw', 'G_raw', 'C_raw', 'N_raw', 'DEL_raw', 'DP_raw', 'vaf_raw', 'base_qual_mean', 'base_qual_stdev', 'base_qual_quartile_1', 'base_qual_quartile_2', 'base_qual_quartile_3', 'maybe_variant']
 
 def process_bam_file(options, umis, targets):
     sample = options.sample
@@ -338,38 +347,73 @@ def process_bam_file(options, umis, targets):
     writer = csv.DictWriter(sys.stdout, delimiter=',', fieldnames=fieldnames) 
     read_stats = ReadStats()
     writer.writeheader()
+
+    seen_coords = set()
+
     for coord, meta in targets.items():
-        chrom, start, end = coord
+        chrom, start = coord
+
+        #print((chrom, start))
         #print(30 * '#')
-        #print(f"{chrom} {start} {end}")
-        # we are only considering SNVs, so the start and end coord should always be exactly 1 bp apart
-        assert end - start == 1
+
         chrom_no_chr = chrom_name_remove_chr(chrom) 
-        carrier_sample, ref, alt, tumour_vaf = meta
-        is_carrier = sample == carrier_sample
-        # get all the reads that align to this position
-        base_qual_stats, pileup_reads = get_pileup_reads(options.mapqual, read_stats, samfile, chrom_no_chr, start, end)
-        # sort the pileup reads based on their leftmost alignment coordinate
-        sorted_pileup_reads = sorted(pileup_reads, key=lambda r: r.alignment.reference_start)
-        # group the pileup reads into runs where consecutive reads are at most 1bp apart
-        # grouped_pileup_reads_pos = group_runs_by(pileup_reads, lambda r: r.alignment.reference_start, adjacent)
-        grouped_pileup_reads_pos = group_runs_by(sorted_pileup_reads, lambda r: r.alignment.reference_start, adjacent)
-        umi_clusters = cluster_reads_by_umi(umis, grouped_pileup_reads_pos)
-        #display_umi_clusters(umi_clusters)
-        cluster_counts, raw_counts = count_bases(umi_clusters)
-        depth_uncorrected = len(pileup_reads)
-        depth_corrected = cluster_counts.A + cluster_counts.T + cluster_counts.G + cluster_counts.C + cluster_counts.N
-        maybe_variant = is_carrier and is_variant(alt, cluster_counts)
-        # bed file input coordinates are zero based, but output format is 1-based to be similar with VCF and
-        # standard variant nomenclature 
-        vaf = compute_vaf(cluster_counts, alt)
-        vaf_raw = compute_vaf(raw_counts, alt)
-        this_row = {'chrom': chrom, 'pos': start+1, 'ref': ref, 'alt': alt, 'sample': sample, 'is_carrier': is_carrier, 'tumour_vaf': tumour_vaf,
-                    'A': cluster_counts.A, 'T': cluster_counts.T, 'G': cluster_counts.G, 'C': cluster_counts.C, 'N': cluster_counts.N, 'DP': depth_corrected, 'vaf': vaf,
-                    'A_raw': raw_counts.A, 'T_raw': raw_counts.T, 'G_raw': raw_counts.G, 'C_raw': raw_counts.C, 'N_raw': raw_counts.N, 'DP_raw': depth_uncorrected, 'vaf_raw': vaf_raw,
-                    'maybe_variant': maybe_variant, 'base_qual_mean': base_qual_stats.mean, 'base_qual_stdev': base_qual_stats.stdev, 
-                    'base_qual_quartile_1': base_qual_stats.quartiles[0], 'base_qual_quartile_2': base_qual_stats.quartiles[1], 'base_qual_quartile_3': base_qual_stats.quartiles[2]}
-        writer.writerow(this_row)
+
+
+        half_window = options.window // 2
+        window_start = start - half_window
+        window_end = start + (options.window - half_window)
+
+        assert(options.window == (window_end - window_start))
+
+        for pos in range(window_start, window_end):
+
+            is_target = pos == start
+
+            if is_target or ((chrom, pos) not in targets and (chrom, pos) not in seen_coords):
+
+                seen_coords.add((chrom, pos))
+
+                # get all the reads that align to this position
+                base_qual_stats, pileup_reads = get_pileup_reads(options.mapqual, read_stats, samfile, chrom_no_chr, pos)
+                # sort the pileup reads based on their leftmost alignment coordinate
+                sorted_pileup_reads = sorted(pileup_reads, key=lambda r: r.alignment.reference_start)
+                # group the pileup reads into runs where consecutive reads are at most 1bp apart
+                grouped_pileup_reads_pos = group_runs_by(sorted_pileup_reads, lambda r: r.alignment.reference_start, adjacent)
+                umi_clusters = cluster_reads_by_umi(umis, grouped_pileup_reads_pos)
+                #display_umi_clusters(umi_clusters)
+                cluster_counts, raw_counts = count_bases(umi_clusters)
+                depth_uncorrected = len(pileup_reads)
+
+                assert(depth_uncorrected == (raw_counts.A + raw_counts.T + raw_counts.G + raw_counts.C + raw_counts.N + raw_counts.D))
+
+                depth_corrected = cluster_counts.A + cluster_counts.T + cluster_counts.G + cluster_counts.C + cluster_counts.N
+
+                if is_target:
+                    carrier_sample, ref, alt, tumour_vaf = meta
+                    vaf = compute_vaf(cluster_counts, alt)
+                    vaf_raw = compute_vaf(raw_counts, alt)
+                    is_carrier = sample == carrier_sample
+                    is_target = True
+                    maybe_variant = is_carrier and is_variant(alt, cluster_counts)
+                else:
+                    maybe_variant = ''
+                    vaf = ''
+                    vaf_raw = ''
+                    ref = ''
+                    alt = ''
+                    tumour_vaf = ''
+                    is_carrier = ''
+                    is_target = False
+                # bed file input coordinates are zero based, but output format is 1-based to be similar with VCF and
+                # standard variant nomenclature 
+                this_row = {'chrom': chrom, 'pos': pos+1, 'ref': ref, 'alt': alt, 'is_target': is_target, 'sample': sample, 'is_carrier': is_carrier, 'tumour_vaf': tumour_vaf,
+                            'A': cluster_counts.A, 'T': cluster_counts.T, 'G': cluster_counts.G, 'C': cluster_counts.C, 'N': cluster_counts.N, 'DP': depth_corrected, 'vaf': vaf,
+                            'A_raw': raw_counts.A, 'T_raw': raw_counts.T, 'G_raw': raw_counts.G, 'C_raw': raw_counts.C, 'N_raw': raw_counts.N, 'DEL_raw': raw_counts.D, 'DP_raw': depth_uncorrected, 'vaf_raw': vaf_raw,
+                            'maybe_variant': maybe_variant, 'base_qual_mean': base_qual_stats.mean, 'base_qual_stdev': base_qual_stats.stdev, 
+                            'base_qual_quartile_1': base_qual_stats.quartiles[0], 'base_qual_quartile_2': base_qual_stats.quartiles[1], 'base_qual_quartile_3': base_qual_stats.quartiles[2]}
+                writer.writerow(this_row)
+            #else:
+            #    print(f"skipping duplicate pos {chrom_no_chr} {pos}")
     logging.info(f"Total number of reads in input: {read_stats.total_reads}")
     logging.info(f"Number of reads retained after quality filtering: {read_stats.retained_reads}, {read_stats.percent_retained_reads():.2f}%")
     samfile.close()
