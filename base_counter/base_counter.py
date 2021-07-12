@@ -288,6 +288,8 @@ def get_cluster_dominant_base(bases):
         return None
 
 def count_bases(clusters):
+    # avg read lengths for each cluster, indexed by dominant base of cluster
+    base_read_lens = {'A': [], 'T': [], 'G': [], 'C': [], 'N': [] } 
     # base counts for collapsed UMI clusters
     cluster_counts = Counts()
     # base counts for all reads at this locus
@@ -296,8 +298,12 @@ def count_bases(clusters):
     # considered the same. We should flatten them into a single base call
     for this_cluster in clusters: 
         this_cluster_bases = []
+        thus_cluster_read_lens = []
         for umi, this_reads in this_cluster.umis_to_reads.items():
             for read in this_reads:
+                # thus_cluster_read_lens.append(read.alignment.query_alignment_length)
+                fragment_length = abs(read.alignment.template_length)
+                thus_cluster_read_lens.append(fragment_length)
                 if not read.is_del and not read.is_refskip:
                     this_base = read.alignment.query_sequence[read.query_position].upper()
                 else:
@@ -305,10 +311,18 @@ def count_bases(clusters):
                     this_base = 'D'
                 this_cluster_bases.append(this_base)
                 all_counts.increment_base_count(this_base)
+        mean_read_len = statistics.mean(thus_cluster_read_lens) 
         dominant_base = get_cluster_dominant_base(this_cluster_bases) 
         if dominant_base is not None:
             cluster_counts.increment_base_count(dominant_base)
-    return cluster_counts, all_counts
+            base_read_lens[dominant_base].append(mean_read_len)
+    base_read_len_means = {} 
+    base_read_len_means['A'] = statistics.mean(base_read_lens['A']) if base_read_lens['A'] else ''
+    base_read_len_means['T'] = statistics.mean(base_read_lens['T']) if base_read_lens['T'] else ''
+    base_read_len_means['G'] = statistics.mean(base_read_lens['G']) if base_read_lens['G'] else ''
+    base_read_len_means['C'] = statistics.mean(base_read_lens['C']) if base_read_lens['C'] else ''
+    base_read_len_means['N'] = statistics.mean(base_read_lens['N']) if base_read_lens['N'] else ''
+    return cluster_counts, all_counts, base_read_len_means
 
 
 def compute_vaf(counts, allele):
@@ -338,7 +352,7 @@ def get_noise(counts, ref, alt):
             noise_read_count += getattr(counts, base)
     return noise_read_count
     
-fieldnames = ['chrom', 'pos', 'ref', 'alt', 'is_target', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'A_raw', 'T_raw', 'G_raw', 'C_raw', 'N_raw', 'DEL_raw', 'DP_raw', 'vaf_raw', 'base_qual_mean', 'base_qual_stdev', 'base_qual_quartile_1', 'base_qual_quartile_2', 'base_qual_quartile_3', 'maybe_variant']
+fieldnames = ['chrom', 'pos', 'ref', 'alt', 'is_target', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'A_raw', 'T_raw', 'G_raw', 'C_raw', 'N_raw', 'DEL_raw', 'DP_raw', 'vaf_raw', 'base_qual_mean', 'base_qual_stdev', 'base_qual_quartile_1', 'base_qual_quartile_2', 'base_qual_quartile_3', 'A_read_len_mean', 'T_read_len_mean', 'G_read_len_mean', 'C_read_len_mean', 'N_read_len_mean', 'maybe_variant']
 
 def process_bam_file(options, umis, targets):
     sample = options.sample
@@ -381,7 +395,7 @@ def process_bam_file(options, umis, targets):
                 grouped_pileup_reads_pos = group_runs_by(sorted_pileup_reads, lambda r: r.alignment.reference_start, adjacent)
                 umi_clusters = cluster_reads_by_umi(umis, grouped_pileup_reads_pos)
                 #display_umi_clusters(umi_clusters)
-                cluster_counts, raw_counts = count_bases(umi_clusters)
+                cluster_counts, raw_counts, base_read_lens = count_bases(umi_clusters)
                 depth_uncorrected = len(pileup_reads)
 
                 assert(depth_uncorrected == (raw_counts.A + raw_counts.T + raw_counts.G + raw_counts.C + raw_counts.N + raw_counts.D))
@@ -410,7 +424,9 @@ def process_bam_file(options, umis, targets):
                             'A': cluster_counts.A, 'T': cluster_counts.T, 'G': cluster_counts.G, 'C': cluster_counts.C, 'N': cluster_counts.N, 'DP': depth_corrected, 'vaf': vaf,
                             'A_raw': raw_counts.A, 'T_raw': raw_counts.T, 'G_raw': raw_counts.G, 'C_raw': raw_counts.C, 'N_raw': raw_counts.N, 'DEL_raw': raw_counts.D, 'DP_raw': depth_uncorrected, 'vaf_raw': vaf_raw,
                             'maybe_variant': maybe_variant, 'base_qual_mean': base_qual_stats.mean, 'base_qual_stdev': base_qual_stats.stdev, 
-                            'base_qual_quartile_1': base_qual_stats.quartiles[0], 'base_qual_quartile_2': base_qual_stats.quartiles[1], 'base_qual_quartile_3': base_qual_stats.quartiles[2]}
+                            'base_qual_quartile_1': base_qual_stats.quartiles[0], 'base_qual_quartile_2': base_qual_stats.quartiles[1], 'base_qual_quartile_3': base_qual_stats.quartiles[2],
+                            'A_read_len_mean': base_read_lens['A'], 'T_read_len_mean': base_read_lens['T'], 'G_read_len_mean': base_read_lens['G'], 'C_read_len_mean': base_read_lens['C'], 'N_read_len_mean': base_read_lens['N']
+                            }
                 writer.writerow(this_row)
             #else:
             #    print(f"skipping duplicate pos {chrom_no_chr} {pos}")
