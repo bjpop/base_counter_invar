@@ -23,10 +23,7 @@ import statistics
 
 EXIT_FILE_IO_ERROR = 1
 EXIT_COMMAND_LINE_ERROR = 2
-EXIT_INVALID_UMI = 3
-EXIT_REPEAT_READ_UMI = 4
 PROGRAM_NAME = "base_counter"
-UMI_LENGTH = 10
 DEFAULT_WINDOW = 1
 MAX_READ_DEPTH = 1000000000
 
@@ -62,8 +59,6 @@ def parse_args():
         help='Bed file coordinates of genomic targets to consider')
     parser.add_argument('--sample', type=str, required=True,
         help='Sample ID')
-    parser.add_argument('--umi', type=str, required=True, help='Path of FASTQ file containing UMIs')
-    #parser.add_argument('--umistats', type=str, required=False, help='Path of CSV file to output UMI stats for this sample')
     parser.add_argument('--window', type=int, required=False, default=DEFAULT_WINDOW, help='Window of loci centered on target for base counting (default: %(default)s)')
     parser.add_argument('--mapqual', type=float, required=False, help='Minimum mapping quality threshold for reads')
     parser.add_argument('--version',
@@ -103,25 +98,38 @@ def get_targets(options):
 class Counts(object):
     def __init__(self):
         self.A = 0
+        self.A_strand = {'fwd': 0, 'rev': 0} 
         self.T = 0
+        self.T_strand = {'fwd': 0, 'rev': 0} 
         self.G = 0
+        self.G_strand = {'fwd': 0, 'rev': 0} 
         self.C = 0
+        self.C_strand = {'fwd': 0, 'rev': 0} 
         self.N = 0
-        self.D = 0    # this counts absentt bases, such as deletions and refskips
+        self.N_strand = {'fwd': 0, 'rev': 0} 
+        self.D = 0    # this counts absent bases, such as deletions and refskips
+        self.D_strand = {'fwd': 0, 'rev': 0} 
+        
 
-    def increment_base_count(self, base):
+    def increment_base_count(self, base, strand):
         if base == 'A':
             self.A += 1
+            self.A_strand[strand] += 1
         elif base == 'T':
             self.T += 1
+            self.T_strand[strand] += 1
         elif base == 'G':
             self.G += 1
+            self.G_strand[strand] += 1
         elif base == 'C':
             self.C += 1
+            self.C_strand[strand] += 1
         elif base == 'N':
             self.N += 1
+            self.N_strand[strand] += 1
         elif base == 'D':
             self.D += 1
+            self.D_strand[strand] += 1
         else:
             exit(f"Unrecognised base: {base}")
 
@@ -140,30 +148,6 @@ def is_variant(alt, counts):
     else:
         return False
 
-
-def group_runs_by(xs, project, comp):
-    result = []
-    current = 0
-    this_group = []
-    while current < len(xs):
-        this_item = xs[current]
-        this_key = project(this_item)
-        if current == 0:
-            this_group.append(this_item)
-        else:
-            previous_key = project(xs[current - 1])
-            if comp(this_key, previous_key):
-                this_group.append(this_item)
-            else:
-                result.append(this_group)
-                this_group = [this_item]
-        current += 1
-    if this_group:
-        result.append(this_group)
-    return result
-
-def adjacent(x, y):
-    return x - y <= 1
 
 VALID_DNA_BASES = "ATGCN"
 valid_dna_bases_set = set(VALID_DNA_BASES)
@@ -188,13 +172,15 @@ class ReadStats:
 
 BaseQualStats = namedtuple("BaseQualStats", ["mean", "stdev", "quartiles"])
 
-    
-def get_pileup_reads(mapqual_threshold, read_stats, samfile, chrom, pos):
-    pileup_reads = []
+
+def get_pileup_stats(mapqual_threshold, read_stats, samfile, chrom, pos):
+    base_read_lens = {'A': [], 'T': [], 'G': [], 'C': [], 'N': [], 'D': [] } 
+    base_counts = Counts()
     # ignore_orphans (bool) – ignore orphans (paired reads that are not in a proper pair). 
     # ignore_overlaps (bool) – If set to True, detect if read pairs overlap and only take the higher quality base. 
     # NOTE: this loop should only happen once for each variant, since they are SNVs and occupy one genomics position
     base_qualities = []
+    strand = None
     for pileupcolumn in samfile.pileup(chrom, pos, pos+1, truncate=True, stepper='samtools',
                                        ignore_overlaps=False, ignore_orphans=False,
                                        max_depth=MAX_READ_DEPTH):
@@ -207,7 +193,19 @@ def get_pileup_reads(mapqual_threshold, read_stats, samfile, chrom, pos):
             this_map_qual = pileupread.alignment.mapping_quality
             if mapqual_threshold is None or this_map_qual >= mapqual_threshold:
                 read_stats.retained_reads += 1
-                pileup_reads.append(pileupread)
+                # thus_cluster_read_lens.append(read.alignment.query_alignment_length)
+                fragment_length = abs(pileupread.alignment.template_length)
+                if pileupread.alignment.is_reverse:
+                    strand = 'rev'
+                else:
+                    strand = 'fwd' 
+                if not pileupread.is_del and not pileupread.is_refskip:
+                    this_base = pileupread.alignment.query_sequence[pileupread.query_position].upper()
+                else:
+                    # deletion and refskip get special 'D' (deletion) base
+                    this_base = 'D'
+                base_counts.increment_base_count(this_base, strand)
+                base_read_lens[this_base].append(fragment_length)
     try:
         base_qual_mean = statistics.mean(base_qualities)
         base_qual_stdev = statistics.stdev(base_qualities)
@@ -217,112 +215,13 @@ def get_pileup_reads(mapqual_threshold, read_stats, samfile, chrom, pos):
         base_qual_stdev = None
         base_qual_quartiles = [None, None, None] 
     base_qual_stats = BaseQualStats(mean=base_qual_mean, stdev=base_qual_stdev, quartiles=base_qual_quartiles)
-    return base_qual_stats, pileup_reads
-
-
-def validate_clusters(counts, clusters):
-    counts_umis = sorted(counts.keys())
-    clusters_umis = sorted([u for c in clusters for u in c])
-    return counts_umis == clusters_umis
-
-# umis_to_reads is a dictionary mapping umi to [reads]
-UmiCluster = namedtuple("UmiCluster", ["umis_to_reads"])
-
-'''
-read_groups is a list of read groups, where each group is aligned
-to the same location (or similar location).
-
-This function clusters the umis for each group.
-
-Result is [UmiCluster]
-'''
-def cluster_reads_by_umi(umis, read_groups):
-    umi_clusterer = UMIClusterer(cluster_method="directional")
-    result = []
-    for group in read_groups:
-        # number of reads for each umi
-        umi_counts = defaultdict(int) 
-        # reads associated with each umi
-        umi_reads = defaultdict(list)
-        for read in group:
-            this_alignment = read.alignment
-            query_name = this_alignment.query_name
-            if query_name in umis:
-                # UMIClusterer requires a bytestring
-               this_umi = umis[query_name].encode()
-               umi_counts[this_umi] += 1 
-               umi_reads[this_umi].append(read)
-        umi_clusters = umi_clusterer(umi_counts, threshold=1)
-        for this_cluster in umi_clusters:
-            this_umis_to_reads = {}
-            for this_umi in this_cluster:
-                this_umis_to_reads[this_umi] = umi_reads[this_umi]
-            result_cluster = UmiCluster(umis_to_reads = this_umis_to_reads)
-            result.append(result_cluster)
-    return result 
-    
-
-def display_umi_clusters(clusters):
-    for this_cluster in clusters:
-        umis = this_cluster.umis_to_reads.keys()
-        cluster_size = len(umis) 
-        if cluster_size >= 8:
-            print(30 * '-')
-            print(f"size: {cluster_size}")
-            for this_umi, this_umi_reads in this_cluster.umis_to_reads.items():
-                print(f"\t{this_umi}")
-                for read in this_umi_reads:
-                    pos = read.alignment.reference_start
-                    print(f"{pos} {read.alignment.query_sequence}") 
-
-
-def get_cluster_dominant_base(bases):
-    counts = Counts()
-    for base in bases:
-        counts.increment_base_count(base)
-    sorted_counts = sorted([(counts.A, 'A'), (counts.T, 'T'), (counts.G, 'G'), (counts.C, 'C')])
-    max_count, max_base = sorted_counts[-1]
-    if max_count > 0:
-        return max_base
-    else:
-        return None
-
-def count_bases(clusters):
-    # avg read lengths for each cluster, indexed by dominant base of cluster
-    base_read_lens = {'A': [], 'T': [], 'G': [], 'C': [], 'N': [] } 
-    # base counts for collapsed UMI clusters
-    cluster_counts = Counts()
-    # base counts for all reads at this locus
-    all_counts = Counts()
-    # this_cluster is a collection of UMIs that cluster together and should be
-    # considered the same. We should flatten them into a single base call
-    for this_cluster in clusters: 
-        this_cluster_bases = []
-        thus_cluster_read_lens = []
-        for umi, this_reads in this_cluster.umis_to_reads.items():
-            for read in this_reads:
-                # thus_cluster_read_lens.append(read.alignment.query_alignment_length)
-                fragment_length = abs(read.alignment.template_length)
-                thus_cluster_read_lens.append(fragment_length)
-                if not read.is_del and not read.is_refskip:
-                    this_base = read.alignment.query_sequence[read.query_position].upper()
-                else:
-                    # deletion and refskip get special 'D' (deletion) base
-                    this_base = 'D'
-                this_cluster_bases.append(this_base)
-                all_counts.increment_base_count(this_base)
-        mean_read_len = statistics.mean(thus_cluster_read_lens) 
-        dominant_base = get_cluster_dominant_base(this_cluster_bases) 
-        if dominant_base is not None:
-            cluster_counts.increment_base_count(dominant_base)
-            base_read_lens[dominant_base].append(mean_read_len)
     base_read_len_means = {} 
     base_read_len_means['A'] = statistics.mean(base_read_lens['A']) if base_read_lens['A'] else ''
     base_read_len_means['T'] = statistics.mean(base_read_lens['T']) if base_read_lens['T'] else ''
     base_read_len_means['G'] = statistics.mean(base_read_lens['G']) if base_read_lens['G'] else ''
     base_read_len_means['C'] = statistics.mean(base_read_lens['C']) if base_read_lens['C'] else ''
     base_read_len_means['N'] = statistics.mean(base_read_lens['N']) if base_read_lens['N'] else ''
-    return cluster_counts, all_counts, base_read_len_means
+    return base_qual_stats, base_read_len_means, base_counts 
 
 
 def compute_vaf(counts, allele):
@@ -352,9 +251,9 @@ def get_noise(counts, ref, alt):
             noise_read_count += getattr(counts, base)
     return noise_read_count
     
-fieldnames = ['chrom', 'pos', 'ref', 'alt', 'is_target', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'A_raw', 'T_raw', 'G_raw', 'C_raw', 'N_raw', 'DEL_raw', 'DP_raw', 'vaf_raw', 'base_qual_mean', 'base_qual_stdev', 'base_qual_quartile_1', 'base_qual_quartile_2', 'base_qual_quartile_3', 'A_read_len_mean', 'T_read_len_mean', 'G_read_len_mean', 'C_read_len_mean', 'N_read_len_mean', 'maybe_variant']
+fieldnames = ['chrom', 'pos', 'ref', 'alt', 'is_target', 'sample', 'is_carrier', 'tumour_vaf', 'A', 'T', 'G', 'C', 'N', 'DP', 'vaf', 'base_qual_mean', 'base_qual_stdev', 'base_qual_quartile_1', 'base_qual_quartile_2', 'base_qual_quartile_3', 'A_read_len_mean', 'T_read_len_mean', 'G_read_len_mean', 'C_read_len_mean', 'N_read_len_mean', 'A_fwd', 'A_rev', 'T_fwd', 'T_rev', 'C_fwd', 'C_rev', 'G_fwd', 'G_rev', 'N_fwd', 'N_rev', 'maybe_variant']
 
-def process_bam_file(options, umis, targets):
+def process_bam_file(options, targets):
     sample = options.sample
     samfile = pysam.AlignmentFile(options.bam, "rb" )
     logging.info(f"Processing BAM file from {options.bam} for sample {sample}")
@@ -366,13 +265,7 @@ def process_bam_file(options, umis, targets):
 
     for coord, meta in targets.items():
         chrom, start = coord
-
-        #print((chrom, start))
-        #print(30 * '#')
-
         chrom_no_chr = chrom_name_remove_chr(chrom) 
-
-
         half_window = options.window // 2
         window_start = start - half_window
         window_end = start + (options.window - half_window)
@@ -388,27 +281,15 @@ def process_bam_file(options, umis, targets):
                 seen_coords.add((chrom, pos))
 
                 # get all the reads that align to this position
-                base_qual_stats, pileup_reads = get_pileup_reads(options.mapqual, read_stats, samfile, chrom_no_chr, pos)
-                # sort the pileup reads based on their leftmost alignment coordinate
-                sorted_pileup_reads = sorted(pileup_reads, key=lambda r: r.alignment.reference_start)
-                # group the pileup reads into runs where consecutive reads are at most 1bp apart
-                grouped_pileup_reads_pos = group_runs_by(sorted_pileup_reads, lambda r: r.alignment.reference_start, adjacent)
-                umi_clusters = cluster_reads_by_umi(umis, grouped_pileup_reads_pos)
-                #display_umi_clusters(umi_clusters)
-                cluster_counts, raw_counts, base_read_lens = count_bases(umi_clusters)
-                depth_uncorrected = len(pileup_reads)
-
-                assert(depth_uncorrected == (raw_counts.A + raw_counts.T + raw_counts.G + raw_counts.C + raw_counts.N + raw_counts.D))
-
-                depth_corrected = cluster_counts.A + cluster_counts.T + cluster_counts.G + cluster_counts.C + cluster_counts.N
+                base_qual_stats, base_read_lens, base_counts = get_pileup_stats(options.mapqual, read_stats, samfile, chrom_no_chr, pos)
+                locus_depth = base_counts.A + base_counts.T + base_counts.G + base_counts.C + base_counts.N
 
                 if is_target:
                     carrier_sample, ref, alt, tumour_vaf = meta
-                    vaf = compute_vaf(cluster_counts, alt)
-                    vaf_raw = compute_vaf(raw_counts, alt)
+                    vaf = compute_vaf(base_counts, alt)
                     is_carrier = sample == carrier_sample
                     is_target = True
-                    maybe_variant = is_carrier and is_variant(alt, cluster_counts)
+                    maybe_variant = is_carrier and is_variant(alt, base_counts)
                 else:
                     maybe_variant = ''
                     vaf = ''
@@ -421,11 +302,15 @@ def process_bam_file(options, umis, targets):
                 # bed file input coordinates are zero based, but output format is 1-based to be similar with VCF and
                 # standard variant nomenclature 
                 this_row = {'chrom': chrom, 'pos': pos+1, 'ref': ref, 'alt': alt, 'is_target': is_target, 'sample': sample, 'is_carrier': is_carrier, 'tumour_vaf': tumour_vaf,
-                            'A': cluster_counts.A, 'T': cluster_counts.T, 'G': cluster_counts.G, 'C': cluster_counts.C, 'N': cluster_counts.N, 'DP': depth_corrected, 'vaf': vaf,
-                            'A_raw': raw_counts.A, 'T_raw': raw_counts.T, 'G_raw': raw_counts.G, 'C_raw': raw_counts.C, 'N_raw': raw_counts.N, 'DEL_raw': raw_counts.D, 'DP_raw': depth_uncorrected, 'vaf_raw': vaf_raw,
+                            'A': base_counts.A, 'T': base_counts.T, 'G': base_counts.G, 'C': base_counts.C, 'N': base_counts.N, 'DP': locus_depth, 'vaf': vaf,
                             'maybe_variant': maybe_variant, 'base_qual_mean': base_qual_stats.mean, 'base_qual_stdev': base_qual_stats.stdev, 
                             'base_qual_quartile_1': base_qual_stats.quartiles[0], 'base_qual_quartile_2': base_qual_stats.quartiles[1], 'base_qual_quartile_3': base_qual_stats.quartiles[2],
-                            'A_read_len_mean': base_read_lens['A'], 'T_read_len_mean': base_read_lens['T'], 'G_read_len_mean': base_read_lens['G'], 'C_read_len_mean': base_read_lens['C'], 'N_read_len_mean': base_read_lens['N']
+                            'A_read_len_mean': base_read_lens['A'], 'T_read_len_mean': base_read_lens['T'], 'G_read_len_mean': base_read_lens['G'], 'C_read_len_mean': base_read_lens['C'], 'N_read_len_mean': base_read_lens['N'],
+                            'A_fwd': base_counts.A_strand['fwd'], 'A_rev': base_counts.A_strand['rev'],
+                            'T_fwd': base_counts.T_strand['fwd'], 'T_rev': base_counts.T_strand['rev'],
+                            'G_fwd': base_counts.G_strand['fwd'], 'G_rev': base_counts.G_strand['rev'],
+                            'C_fwd': base_counts.C_strand['fwd'], 'C_rev': base_counts.C_strand['rev'],
+                            'N_fwd': base_counts.N_strand['fwd'], 'N_rev': base_counts.N_strand['rev'],
                             }
                 writer.writerow(this_row)
             #else:
@@ -433,37 +318,6 @@ def process_bam_file(options, umis, targets):
     logging.info(f"Total number of reads in input: {read_stats.total_reads}")
     logging.info(f"Number of reads retained after quality filtering: {read_stats.retained_reads}, {read_stats.percent_retained_reads():.2f}%")
     samfile.close()
-
-
-def is_valid_umi(umi):
-    return len(umi) == UMI_LENGTH and valid_dna_bases_set.issuperset(set(umi)) 
-
-def get_umis(options):
-    # mapping from read IDs to UMIs
-    result = {}
-    with pysam.FastxFile(options.umi) as file:
-        for entry in file:
-            if entry.name not in result:
-                if is_valid_umi(entry.sequence):
-                   result[entry.name] = entry.sequence
-                else:
-                   exit_with_error(f"Invalid UMI: {entry.sequence}", EXIT_INVALID_UMI) 
-            else:
-                exit_with_error(f"Read ID repeated in UMI file: {entry.name}", EXIT_REPEAT_READ_UMI)
-    return result
-
-def umi_stats(options, umis):
-    total_umis = 0
-    unique_umis = set()
-    for read, umi in umis.items():
-        total_umis += 1
-        unique_umis.add(umi)
-    num_unqiue_umis = len(unique_umis)
-    num_umis_with_n = sum([1 for u in unique_umis if u.count("N") > 0])
-    if options.umistats:
-        with open(options.umistats, "w") as file:
-            print(f"{total_umis},{num_unqiue_umis},{num_umis_with_n}", file=file)
-        
 
 
 def init_logging(log_filename):
@@ -493,11 +347,8 @@ def main():
     "Orchestrate the execution of the program"
     options = parse_args()
     init_logging(options.log)
-    # umis is a dictionary mapping read ID to UMI
-    umis = get_umis(options)
-    #umi_stats(options, umis)
     targets = get_targets(options) 
-    process_bam_file(options, umis, targets)
+    process_bam_file(options, targets)
 
 
 # If this script is run from the command line then call the main function.
